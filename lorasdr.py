@@ -43,17 +43,20 @@ def dechirp_fft(seg, ref, zoom=1):
     return np.abs(np.fft.fft(seg * ref, N * zoom))
 
 
-def find_preamble(y, sf, min_up=6):
-    """Coarse search: index of the first whole-symbol window that begins a run of min_up
-    up-chirps with the same FFT bin. Alignment is fixed later by sync_estimate."""
+def find_preamble(y, sf, min_up=5, thresh=3.0):
+    """Coarse search: first whole-symbol window that begins a run of min_up up-chirps whose
+    FFT bins agree within +-1 and whose peaks stand above the noise (amplitude ratio > thresh).
+    Bin agreement does most of the work: noise almost never repeats a bin 5 times in a row."""
     N, up, dn = chirps(sf)
     nsym = len(y) // N
-    bins = np.empty(nsym, int); mags = np.empty(nsym)
-    for i in range(nsym):
-        f = dechirp_fft(y[i * N:(i + 1) * N], dn)
-        bins[i] = f.argmax(); mags[i] = f.max() / (f.mean() + 1e-12)
+    if nsym < min_up: return None, None
+    W = y[:nsym * N].reshape(nsym, N) * dn
+    F = np.abs(np.fft.fft(W, axis=1))
+    bins = F.argmax(axis=1); mags = F.max(axis=1) / (F.mean(axis=1) + 1e-12)
     for i in range(nsym - min_up):
-        if mags[i] > 8 and np.all(bins[i:i + min_up] == bins[i]):
+        if mags[i] <= thresh: continue
+        d = (bins[i:i + min_up] - bins[i] + N // 2) % N - N // 2
+        if np.all(np.abs(d) <= 1) and np.all(mags[i:i + min_up] > thresh):
             return i * N, int(bins[i])
     return None, None
 
@@ -338,23 +341,133 @@ def synchronize(x, fs, offset_hz, bw, sf, coarse, syncword=0x34, max_walk=16, cf
     return cfo, tau, pay_chip, info
 
 
-def demod_from(x, fs, offset_hz, bw, sf, cfo, tau, pay_chip, nsym):
+def demod_from(x, fs, offset_hz, bw, sf, cfo, tau, pay_chip, nsym, track=True, max_slip=None):
+    """Demodulate nsym payload symbols. With track=True, follow timing slips (e.g. samples the
+    SDR silently dropped): when a symbol's peak suddenly weakens, search the next symbol for a
+    new alignment (in whole chips) and continue from there.
+    Returns (symbols, confidence, alternatives) where alternatives[i] is a list of other
+    plausible values for weak symbols (used by CRC-guided repair)."""
     from scipy.signal import resample_poly
     N, up, dn = chirps(sf)
     dec = int(round(fs / bw))
-    k0 = int(round(pay_chip * dec + tau * dec))  # same convention as synchronize.cut
-    seg = x[k0:k0 + nsym * N * dec]
-    n = np.arange(len(seg), dtype=np.float64) + k0
-    seg = seg * np.exp(-2j * np.pi * offset_hz * n / fs).astype(np.complex64)
-    y = resample_poly(seg, 1, dec).astype(np.complex64)
-    k = np.arange(len(y)); y = y * np.exp(-2j * np.pi * cfo * k / N).astype(np.complex64)
-    syms = []; conf = []
+    max_slip = N // 2 if max_slip is None else max_slip        # chips
+    margin = max_slip + 2
+    k0 = int(round(pay_chip * dec + tau * dec)) - margin * dec
+    lo = max(k0, 0)
+    seg = x[lo:k0 + (nsym * N + 2 * margin) * dec + dec]
+    n = np.arange(len(seg), dtype=np.float64) + lo
+    seg = seg * np.exp(-2j * np.pi * (offset_hz + cfo * bw / N) * n / fs).astype(np.complex64)
+    # dec polyphase copies at chip rate: phase p = stream delayed by p input samples
+    from scipy.signal import firwin, lfilter
+    h = firwin(8 * dec + 1, 0.5 / dec * 1.0).astype(np.float32)
+    filt = lfilter(h, 1.0, seg).astype(np.complex64)
+    gd = (len(h) - 1) // 2
+    Y = [filt[gd + p::dec] for p in range(dec)]
+    base = (k0 - lo) + margin * dec                       # input-sample index of symbol 0 (aligned)
+    def peaks(i_samp):
+        if i_samp < 0: return None
+        ph, c = i_samp % dec, i_samp // dec
+        w = Y[ph][c:c + N]
+        if len(w) < N: return None
+        f = np.abs(np.fft.fft(w * dn))
+        order = np.argsort(f)[::-1][:3]
+        return [int(v) for v in order], float(f[order[0]] / (f.mean() + 1e-12))
+    syms = []; conf = []; alts = []; adj = 0; ref = None      # adj in input samples
     for i in range(nsym):
-        w = y[i * N:(i + 1) * N]
-        if len(w) < N: break
-        v, m = _fine_peak(w, dn, N, 4)
-        syms.append(int(round(v)) % N); conf.append(m)
-    return np.array(syms), np.array(conf)
+        pk = peaks(base + i * N * dec + adj)
+        if pk is None: break
+        vals, m = pk
+        if ref is None and i >= 1: ref = float(np.median(conf + [m]))
+        cand = [v for v in vals[1:3]]
+        if track and ref is not None and m < 0.7 * ref:
+            nxt = peaks(base + (i + 1) * N * dec + adj)
+            if nxt is not None and nxt[1] < 0.8 * ref:
+                best = (0.0, None)
+                for d in range(-max_slip * dec, max_slip * dec + 1, dec):      # coarse: whole chips
+                    q = peaks(base + (i + 1) * N * dec + adj + d)
+                    if q is not None and q[1] > best[0]: best = (q[1], d)
+                if best[1] is not None:
+                    d0 = best[1]
+                    for d in range(d0 - dec, d0 + dec + 1):                     # fine: single samples
+                        q = peaks(base + (i + 1) * N * dec + adj + d)
+                        if q is not None and q[1] > best[0]: best = (q[1], d)
+                if best[1] is not None and best[0] > 0.8 * ref:
+                    adj += best[1]
+                    q = peaks(base + i * N * dec + adj)
+                    if q is not None:
+                        cand = [q[0][0]] + q[0][1:2] + cand
+        syms.append(vals[0]); conf.append(m)
+        alts.append([c for c in dict.fromkeys(cand) if c != vals[0]][:3])
+    return np.array(syms), np.array(conf), alts
+
+
+def crc_repair(syms, conf, alts, sf, ldro, max_weak=8, max_tries=4096, implicit=None):
+    """If the CRC fails, try (1) a timing slip of -2..+2 chips starting at each weak symbol
+    (everything after it shifted), with the weak symbol itself re-chosen; (2) alternative values
+    for the weakest symbols. The CRC decides."""
+    import itertools
+    N = 1 << sf
+    r = decode_frame(syms, sf, ldro=ldro, verbose=False, implicit=implicit)
+    if r is None or r["crc_ok"] is not False:
+        return r, 0
+    syms = np.array(syms); conf = np.asarray(conf)
+    ref = float(np.median(conf))
+    weak = [int(i) for i in np.argsort(conf) if i >= 8][:max_weak]
+    slip_pts = [i for i in weak if conf[i] < 0.8 * ref] or weak[:3]
+    tries = 0
+    def ok(s2, how):
+        nonlocal tries
+        tries += 1
+        r2 = decode_frame(s2, sf, ldro=ldro, verbose=False, implicit=implicit)
+        if r2 and r2["crc_ok"]:
+            r2["repaired"] = how
+            return r2
+        return None
+    # (1) slip hypotheses
+    for i in slip_pts:
+        # a straddling symbol shows the old and new timing as two peaks: their distance = the slip
+        sizes = [-1, 1, -2, 2]
+        for a_ in alts[i]:
+            for sh in ((a_ - syms[i]) % N, (syms[i] - a_) % N):
+                sh = sh - N if sh > N // 2 else sh
+                if sh not in sizes and sh != 0: sizes.append(int(sh))
+        for sh in sizes:
+            s2 = syms.copy(); s2[i + 1:] = (s2[i + 1:] + sh) % N
+            for v in [syms[i], (syms[i] + sh) % N] + list(alts[i]):
+                s3 = s2.copy(); s3[i] = v
+                got = ok(s3, [f"slip {sh:+d} after symbol {i}"])
+                if got: return got, tries
+    # (1b) two slips in one frame (long frames at high SF)
+    def sizes_at(i):
+        out = [-1, 1]
+        for a_ in alts[i]:
+            for sh in ((a_ - syms[i]) % N, (syms[i] - a_) % N):
+                sh = sh - N if sh > N // 2 else sh
+                if sh not in out and sh != 0: out.append(int(sh))
+        return out
+    for i, j in itertools.combinations(sorted(slip_pts), 2):
+        for si in sizes_at(i):
+            for sj in sizes_at(j):
+                if tries > max_tries: return r, tries
+                s2 = syms.copy()
+                s2[i + 1:] = (s2[i + 1:] + si) % N
+                s2[j + 1:] = (s2[j + 1:] + sj) % N
+                for vi in (s2[i], (syms[i] + si) % N):
+                    for vj in (s2[j], (syms[j] + si + sj) % N):
+                        s3 = s2.copy(); s3[i] = vi; s3[j] = vj
+                        got = ok(s3, [f"slip {si:+d} after symbol {i}", f"slip {sj:+d} after symbol {j}"])
+                        if got: return got, tries
+    # (2) symbol alternatives
+    weak = [i for i in weak if alts[i]]
+    for k in range(1, len(weak) + 1):
+        for idx in itertools.combinations(weak, k):
+            for choice in itertools.product(*[alts[i] for i in idx]):
+                if tries > max_tries: return r, tries
+                s2 = syms.copy()
+                for i, v in zip(idx, choice): s2[i] = v
+                got = ok(s2, [f"symbol {i}" for i in idx])
+                if got: return got, tries
+    return r, tries
 
 
 # ------------------------------------------------------------------ bit level
@@ -412,14 +525,16 @@ def crc16(data):
 
 def lora_crc(payload):
     """LoRa payload CRC: CRC16 over all but the last two bytes, then xor the last two in."""
-    if len(payload) < 2: return crc16(payload)
     c = crc16(payload[:-2])
-    return c ^ payload[-1] ^ (payload[-2] << 8)
+    if len(payload) >= 1: c ^= payload[-1]
+    if len(payload) >= 2: c ^= payload[-2] << 8
+    return c
 
 
 # ------------------------------------------------------------------ frame decode
-def decode_frame(syms, sf, dewhiten=True, ldro=False, verbose=True, header_only=False):
-    """syms: demodulated symbol values starting at the first header symbol."""
+def decode_frame(syms, sf, dewhiten=True, ldro=False, verbose=True, header_only=False, implicit=None):
+    """syms: demodulated symbol values starting at the first header symbol.
+    implicit=(length, cr, has_crc): no header was sent; the first block carries payload only."""
     N = 1 << sf
     # --- header block: 8 symbols at CR4/8, sf-2 bits per symbol ("reduced rate")
     sf_app = sf - 2
@@ -439,6 +554,10 @@ def decode_frame(syms, sf, dewhiten=True, ldro=False, verbose=True, header_only=
     c0 = (n0 & 1) ^ (n1 >> 1 & 1) ^ (n2 >> 3 & 1) ^ (n2 >> 2 & 1) ^ (n2 >> 1 & 1) ^ (n2 & 1)
     chk = (c4 << 4) | (c3 << 3) | (c2 << 2) | (c1 << 1) | c0
     hdr_ok = chk == hdr_chk
+    if implicit is not None:
+        length, cr, has_crc = implicit
+        hdr_ok = True
+        nibbles = [0] * 5 + nibbles            # pretend 5 header nibbles so nibbles[5:] = whole first block
     if verbose:
         print(f"header: len={length} cr=4/{4 + cr} crc={'yes' if has_crc else 'no'} "
               f"chk={hdr_chk:#04x} calc={chk:#04x} {'OK' if hdr_ok else 'MISMATCH'}")
@@ -526,7 +645,7 @@ def _interleave(cws, sf_app, cw_len):
     return out
 
 
-def encode(payload, sf, cr=1, has_crc=True, ldro=False):
+def encode(payload, sf, cr=1, has_crc=True, ldro=False, implicit=False):
     """payload bytes -> list of transmitted symbol values (explicit header), matching decode_frame."""
     N = 1 << sf
     wp = bytes(b ^ w for b, w in zip(payload, whitening(len(payload))))
@@ -542,8 +661,11 @@ def encode(payload, sf, cr=1, has_crc=True, ldro=False):
     chk = _hdr_checksum(n0, n1, n2)
     hdr = [n0, n1, n2, chk >> 4, chk & 0xF]
     sf_app = sf - 2
-    first = hdr + nib[:sf_app - 5]
-    rest = nib[sf_app - 5:]
+    if implicit:
+        first = nib[:sf_app]; rest = nib[sf_app:]
+    else:
+        first = hdr + nib[:sf_app - 5]
+        rest = nib[sf_app - 5:]
     first += [0] * (sf_app - len(first))
     syms = [((_gray_inv(v) << 2) + 1) % N for v in _interleave([_hamming_encode(n, 8) for n in first], sf_app, 8)]
     cw_len = 4 + cr
@@ -557,6 +679,43 @@ def encode(payload, sf, cr=1, has_crc=True, ldro=False):
 
 
 # ------------------------------------------------------------------ main
+def frames(x, fs, offset_hz, bw, sf, syncword=0x34, ldro=None, max_frames=50, verbose=False, invert_iq=False, implicit=None):
+    """Yield one dict per detected frame: start time, sync info, symbols, confidence, decode result.
+    invert_iq: the transmitter swapped up/down chirps (LoRaWAN downlinks); decode the mirror image."""
+    if invert_iq:
+        x = np.conj(x); offset_hz = -offset_hz
+    y = to_baseband(x, fs, offset_hz, bw)
+    N = 1 << sf
+    ldro = (N / bw > 0.016) if ldro is None else ldro
+    pos = 0; found = 0; last_cfo = None
+    while found < max_frames:
+        start, b = find_preamble(y[pos:], sf)
+        if start is None: return
+        start += pos
+        try:
+            cfo, sto, pay, info = synchronize(x, fs, offset_hz, bw, sf, start + 2 * N, syncword=syncword, cfo_hint=last_cfo)
+        except Exception as e:
+            if verbose: print(f"  [no sync @ {start / bw:.3f} s: {e}]")
+            pos = start + 4 * N; continue
+        found += 1
+        if info["err"] < 0.5: last_cfo = cfo
+        syms, conf, alts = demod_from(x, fs, offset_hz, bw, sf, cfo, sto, pay, 8)
+        hdr = decode_frame(syms, sf, ldro=ldro, verbose=False, header_only=True, implicit=implicit)
+        need = 8
+        if hdr:
+            nib = 2 * hdr["length"] + (4 if hdr["has_crc"] else 0)
+            need = 8 + (4 + hdr["cr"]) * (nib // (sf - (2 if ldro else 0)) + 2)
+        syms, conf, alts = demod_from(x, fs, offset_hz, bw, sf, cfo, sto, pay, need)
+        r, tries = crc_repair(syms, conf, alts, sf, ldro, implicit=implicit) if hdr else (None, 0)
+        # in-channel SNR: payload power vs the quietest stretch before the preamble
+        pre = y[max(0, start - 24 * N):max(0, start - 2 * N)]
+        pn = float(np.percentile([np.mean(np.abs(pre[k:k + N]) ** 2) for k in range(0, max(len(pre) - N, 1), N)] or [np.nan], 20)) if len(pre) > N else np.nan
+        p0 = int(pay); ps_ = float(np.mean(np.abs(y[p0:p0 + max(len(syms), 1) * N]) ** 2))
+        snr = 10 * np.log10(max(ps_ - pn, 1e-30) / pn) if pn == pn and pn > 0 else float("nan")
+        yield dict(snr=snr, tries=tries, t=start / bw, cfo=cfo, sto=sto, info=info, syms=syms, conf=conf, hdr=hdr, result=r, ldro=ldro, pay=pay)
+        pos = max(int(pay) + len(syms) * N, start + 12 * N)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("mode", choices=["decode", "whiten", "scan"])
@@ -569,52 +728,38 @@ def main():
     ap.add_argument("--raw", action="store_true", help="do not de-whiten the payload")
     ap.add_argument("--sync", type=lambda v: int(v, 0), default=0x34)
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--invert-iq", action="store_true", help="frames sent with inverted IQ (LoRaWAN downlinks)")
+    ap.add_argument("--implicit", default=None, help="implicit header: LEN,CR,CRC e.g. 12,1,1")
     ap.add_argument("--ldro", type=int, default=None, help="force low-data-rate optimisation 0/1 (default: auto)")
     ap.add_argument("--max-frames", type=int, default=50)
     a = ap.parse_args()
 
     x = load_cs16(a.cap)
-    y = to_baseband(x, a.fs, a.offset_khz * 1e3, a.bw)
     N = 1 << a.sf
-    ldro = a.ldro if a.ldro is not None else (N / a.bw > 0.016)
-    print(f"{len(x)} samples @ {a.fs:.0f} -> {len(y)} @ {a.bw:.0f} ({len(y) / a.bw:.1f} s), N={N}")
-    pos = 0; found = 0; ok = 0; last_cfo = None
-    while found < a.max_frames:
-        start, b = find_preamble(y[pos:], a.sf)
-        if start is None: break
-        start += pos
-        try:
-            cfo, sto, pay, info = synchronize(x, a.fs, a.offset_khz * 1e3, a.bw, a.sf, start + 2 * N, syncword=a.sync, cfo_hint=last_cfo)
-        except Exception as e:
-            if a.verbose: print(f"  [no sync @ {start / a.bw:.3f} s: {e}]")
-            pos = start + 4 * N; continue
+    ldro = None if a.ldro is None else bool(a.ldro)
+    print(f"{len(x)} samples @ {a.fs:.0f} ({len(x) / a.fs:.1f} s), SF{a.sf} BW{a.bw / 1e3:g}k sync {a.sync:#04x}")
+    found = 0; ok = 0
+    for f in frames(x, a.fs, a.offset_khz * 1e3, a.bw, a.sf, syncword=a.sync, ldro=ldro,
+                    max_frames=a.max_frames, verbose=a.verbose, invert_iq=a.invert_iq,
+                    implicit=tuple(int(v) for v in a.implicit.split(',')) if a.implicit else None):
         found += 1
-        if info["err"] < 0.5: last_cfo = cfo
-        syms, conf = demod_from(x, a.fs, a.offset_khz * 1e3, a.bw, a.sf, cfo, sto, pay, 8)
-        need = 8 + 4 + 8 * ((2 * (255 + 2)) // (a.sf - (2 if ldro else 0)) + 1)
-        hdr = decode_frame(syms, a.sf, ldro=ldro, verbose=False, header_only=True)
-        if hdr:
-            nib = 2 * hdr["length"] + (4 if hdr["has_crc"] else 0)
-            need = 8 + (4 + hdr["cr"]) * (nib // (a.sf - (2 if ldro else 0)) + 2)
-        if not hdr:
-            need = 8
-        syms, conf = demod_from(x, a.fs, a.offset_khz * 1e3, a.bw, a.sf, cfo, sto, pay, need)
-        ps = int(pay) + len(syms) * N
-        print(f"\nframe {found} @ {start / a.bw:.3f} s: pre {[round(float(v), 2) for v in info['pre']]} sync {[round(float(v), 2) for v in info['sync']]} "
-              f"cfo {cfo:+.2f} bins ({cfo * a.bw / N:+.0f} Hz), sto {sto:+.2f} chips, err {info['err']}, conf {conf[:8].mean():.1f}")
+        info, conf, syms = f["info"], f["conf"], f["syms"]
+        print(f"\nframe {found} @ {f['t']:.3f} s: snr {f['snr']:+.1f} dB, sync {[round(float(v), 2) for v in info['sync']]} "
+              f"cfo {f['cfo']:+.2f} bins ({f['cfo'] * a.bw / N:+.0f} Hz), sto {f['sto']:+.2f} chips, err {info['err']}, conf {conf[:8].mean():.1f}")
         if a.mode == "scan":
-            print("  symbols:", syms[:24].tolist())
-        else:
-            r = decode_frame(syms, a.sf, dewhiten=not a.raw, ldro=ldro)
-            if r:
-                p = r["payload"]
-                txt = p.decode("ascii", "replace")
-                print(f"  payload[{r['length']}] cr=4/{4 + r['cr']} crc_rx={r['crc_rx']} crc_ok={r['crc_ok']} "
-                      f"corrected={r['corrected']}\n  hex {p.hex()}\n  text {txt!r}")
-                if a.expect and a.expect.encode() in p: ok += 1; print("  MATCHES expected text")
-                if a.mode == "whiten":
-                    print("  payload xor whitening table (all-zero TX should give zeros):", p.hex())
-        pos = max(ps, start + 12 * N)
+            print("  symbols:", syms[:24].tolist()); continue
+        r = f["result"]
+        if not f["hdr"]:
+            print("  header: checksum failed"); continue
+        if r:
+            p = r["payload"]
+            rep = f" repaired symbols {r['repaired']} ({f['tries']} tries)" if r.get("repaired") else ""
+            print(f"  header: len={r['length']} cr=4/{4 + r['cr']} crc={'yes' if r['has_crc'] else 'no'}\n"
+                  f"  payload[{r['length']}] cr=4/{4 + r['cr']} crc_rx={r['crc_rx']} crc_ok={r['crc_ok']} corrected={r['corrected']}{rep}\n"
+                  f"  hex {p.hex()}\n  text {p.decode('ascii', 'replace')!r}")
+            if a.expect and a.expect.encode() in p: ok += 1; print("  MATCHES expected text")
+            if a.mode == "whiten":
+                print("  payload xor whitening table (all-zero TX should give zeros):", p.hex())
     print(f"\n{found} frames found" + (f", {ok} matched" if a.expect else ""))
 
 
