@@ -193,7 +193,7 @@ def refine_and_demod(x, fs, offset_hz, bw, sf, astart, n_up, nsym, margin=4, syn
     q, y2, sync, sgn = best
     rot = np.exp(-2j * np.pi * cfo * k / N).astype(np.complex64)
     # the sync word is known: use it as the absolute bin reference for the payload symbols
-    exp_sync = [((syncword >> 4) & 0xF) * 8, (syncword & 0xF) * 8]
+    exp_sync = list(sync_symbols(syncword, N))
     def wrap(d): return (d + N / 2) % N - N / 2
     ref = float(np.mean([wrap(sync[j] - exp_sync[j]) for j in range(2)]))
     ps = p0 + n_up * N + 2 * N + int(round(2.25 * N))
@@ -233,6 +233,16 @@ def _fine_peak(seg, ref, N, zoom=16):
     return (b + N / 2) % N - N / 2, float(c / (f.mean() + 1e-12))
 
 
+def sync_symbols(syncword, N):
+    """The two sync-word symbols. Each nibble is sent as a SIGNED 4-bit value times 8 (measured on
+    air with sync 0x2B at SF11: B -> -40, not 88; at SF7 the two coincide mod 128)."""
+    def sym(nib):
+        v = nib * 8
+        v = ((v + 64) % 128) - 64
+        return v % N
+    return sym((syncword >> 4) & 0xF), sym(syncword & 0xF)
+
+
 def synchronize(x, fs, offset_hz, bw, sf, coarse, syncword=0x34, max_walk=16, cfo_hint=None):
     """Measure-don't-guess frame sync.
     coarse: index (at fs=bw) of a window inside the preamble.
@@ -244,7 +254,7 @@ def synchronize(x, fs, offset_hz, bw, sf, coarse, syncword=0x34, max_walk=16, cf
     from scipy.signal import resample_poly
     N, up, dn = chirps(sf)
     dec = int(round(fs / bw))
-    s0, s1 = ((syncword >> 4) & 0xF) * 8, (syncword & 0xF) * 8
+    s0, s1 = sync_symbols(syncword, N)
     def cut(i0_chips, nsym, shift_samples=0.0):
         k0 = int(round(i0_chips * dec + shift_samples))
         k1 = k0 + nsym * N * dec
@@ -281,7 +291,7 @@ def synchronize(x, fs, offset_hz, bw, sf, coarse, syncword=0x34, max_walk=16, cf
     def wrap(v): return (v + N / 2) % N - N / 2
     _dbg = dict(fu=round(fu, 2), fd=round(fd, 2), ksync=ksync - back)
     best = None
-    max_cfo = min(N / 8, 20e3 / (bw / N))          # real crystals: well under 20 kHz
+    max_cfo = N / 4 - 1                             # +-25 % of the bandwidth, the tolerance LoRa chips specify
     for c_off in (0.0, N / 2):
         cfo = wrap((fu + fd) / 2 + c_off); tau = wrap((fd - fu) / 2 + c_off)
         if abs(cfo) > max_cfo: continue
