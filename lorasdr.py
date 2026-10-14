@@ -142,7 +142,7 @@ def preamble_base(y, start, sf, n_up, cfo_bins=0.0, zoom=16):
     return bin_f if bin_f <= N / 2 else bin_f - N
 
 
-def refine_and_demod(x, fs, offset_hz, bw, sf, astart, n_up, nsym, margin=4, syncword=0x34):
+def refine_and_demod(x, fs, offset_hz, bw, sf, astart, n_up, nsym, margin=4, syncword=0x34, extra=0):
     """Fine synchronisation on the 1 MS/s stream: fractional CFO from the phase advance between
     preamble up-chirps, fractional timing from the fine up-chirp bin, then re-cut the frame with
     the timing corrected (1/dec chip resolution), rotate the CFO away and demodulate.
@@ -151,7 +151,7 @@ def refine_and_demod(x, fs, offset_hz, bw, sf, astart, n_up, nsym, margin=4, syn
     N, up, dn = chirps(sf)
     dec = int(round(fs / bw))
     def cut(shift_samples):
-        k0 = astart * dec + shift_samples - margin * N * dec
+        k0 = astart * dec + shift_samples + extra - margin * N * dec
         k1 = k0 + (n_up + 4 + nsym + 2 * margin) * N * dec
         seg = x[max(k0, 0):k1]
         n = np.arange(len(seg), dtype=np.float64) + max(k0, 0)
@@ -203,6 +203,158 @@ def refine_and_demod(x, fs, offset_hz, bw, sf, astart, n_up, nsym, margin=4, syn
         fine.append(fb); syms.append(int(round(fb - ref)) % N); conf.append(float(f.max() / (f.mean() + 1e-12)))
     info = dict(cfo=cfo, sto=sto * sgn, sync=[round(v, 2) for v in sync], sync_q=round(q, 2), fine=fine, ref=round(ref, 2))
     return np.array(syms), np.array(conf), info
+
+
+def best_demod(x, fs, offset_hz, bw, sf, astart, n_up, nsym, syncword=0x34, span=None):
+    """Decision-directed timing: try timing nudges of whole input samples (1/dec chip) and keep
+    the one whose symbols land closest to integer bins (sum of distances over the first symbols)."""
+    dec = int(round(fs / bw))
+    span = dec if span is None else span
+    best = None
+    for extra in range(-span, span + 1):
+        syms, conf, info = refine_and_demod(x, fs, offset_hz, bw, sf, astart, n_up, nsym, syncword=syncword, extra=extra)
+        fine = np.array(info["fine"][:min(len(info["fine"]), 48)]) - info["ref"]
+        score = float(np.mean(np.abs(fine - np.round(fine))))
+        if best is None or score < best[0]:
+            best = (score, syms, conf, dict(info, extra=extra, frac_err=round(score, 3)))
+    return best[1], best[2], best[3]
+
+
+def _fine_peak(seg, ref, N, zoom=16):
+    """Fractional dechirp peak in signed bins (-N/2, N/2], parabolic interpolation."""
+    f = dechirp_fft(seg, ref, zoom)
+    k = int(f.argmax()); M = len(f)
+    l, c, r = f[(k - 1) % M], f[k], f[(k + 1) % M]
+    den = l - 2 * c + r
+    b = (k + (0.5 * (l - r) / den if den != 0 else 0.0)) / zoom
+    return (b + N / 2) % N - N / 2, float(c / (f.mean() + 1e-12))
+
+
+def synchronize(x, fs, offset_hz, bw, sf, coarse, syncword=0x34, max_walk=16, cfo_hint=None):
+    """Measure-don't-guess frame sync.
+    coarse: index (at fs=bw) of a window inside the preamble.
+    1. walk windows until the two known sync symbols appear (relative to the preamble bin)
+    2. fine up-chirp bin fu (preamble) and down-chirp bin fd (2 windows after sync): with the
+       window starting tau chips early, fu = cfo - tau, fd = cfo + tau
+    3. re-cut the 1 MS/s stream shifted by tau, de-rotate cfo; verify the sync symbols land on
+       integers; return the aligned stream and where the payload starts in it."""
+    from scipy.signal import resample_poly
+    N, up, dn = chirps(sf)
+    dec = int(round(fs / bw))
+    s0, s1 = ((syncword >> 4) & 0xF) * 8, (syncword & 0xF) * 8
+    def cut(i0_chips, nsym, shift_samples=0.0):
+        k0 = int(round(i0_chips * dec + shift_samples))
+        k1 = k0 + nsym * N * dec
+        seg = x[max(k0, 0):k1]
+        n = np.arange(len(seg), dtype=np.float64) + max(k0, 0)
+        seg = seg * np.exp(-2j * np.pi * offset_hz * n / fs).astype(np.complex64)
+        return resample_poly(seg, 1, dec).astype(np.complex64)
+    # --- 1. structure: preamble bin and sync position
+    back = 2 * N
+    y = cut(coarse - back, max_walk + 8)
+    pb, _ = _fine_peak(y[back:back + N], dn, N)
+    i = back; ksync = None
+    cands = []
+    q = N // 8                                   # eighth-symbol steps: some step is within N/8 of alignment
+    for w in range(4 * max_walk):
+        o = i + w * q
+        if o + 2 * N > len(y): break
+        a, ma = _fine_peak(y[o:o + N], dn, N)
+        b, mb = _fine_peak(y[o + N:o + 2 * N], dn, N)
+        # moving the window by d chips moves every dechirped bin by -d: correct the preamble reference
+        ref = pb - (o - back)
+        ra, rb = (a - ref) % N, (b - ref) % N
+        if min(abs(ra - s0), N - abs(ra - s0)) < 2.5 and min(abs(rb - s1), N - abs(rb - s1)) < 2.5:
+            cands.append((ma + mb, o))
+        elif cands:
+            break                                # past the sync word
+    if cands:
+        ksync = max(cands)[1]                    # strongest = best aligned
+    if ksync is None:
+        raise RuntimeError("sync word not found")
+    # --- 2. fine bins
+    fu = float(np.median([_fine_peak(y[ksync - k * N:ksync - (k - 1) * N], dn, N)[0] for k in (1, 2, 3, 4)]))
+    fd = float(np.mean([_fine_peak(y[ksync + k * N:ksync + (k + 1) * N], up, N)[0] for k in (2, 3)]))
+    def wrap(v): return (v + N / 2) % N - N / 2
+    _dbg = dict(fu=round(fu, 2), fd=round(fd, 2), ksync=ksync - back)
+    best = None
+    max_cfo = min(N / 8, 20e3 / (bw / N))          # real crystals: well under 20 kHz
+    for c_off in (0.0, N / 2):
+        cfo = wrap((fu + fd) / 2 + c_off); tau = wrap((fd - fu) / 2 + c_off)
+        if abs(cfo) > max_cfo: continue
+        for sgn in (+1, -1):
+            start_chip = coarse - back + ksync - 6 * N          # 6 preamble symbols of margin
+            y2 = cut(start_chip, 6 + 4 + 2 + 1, shift_samples=sgn * tau * dec)
+            k = np.arange(len(y2)); y2 = y2 * np.exp(-2j * np.pi * cfo * k / N).astype(np.complex64)
+            ks = 6 * N
+            e = 0.0; vals = []
+            for j, want in ((-2, 0), (-1, 0), (0, s0), (1, s1)):
+                v, _ = _fine_peak(y2[ks + j * N:ks + (j + 1) * N], dn, N)
+                vals.append(round(v % N, 2)); e += abs(wrap(v - want))
+            d, _ = _fine_peak(y2[ks + 2 * N:ks + 3 * N], up, N); e += abs(wrap(d))
+            if best is None or e < best[0]:
+                best = (e, cfo, sgn * tau, start_chip, vals)
+    if best is None and cfo_hint is not None:
+        # implausible own measurement: trust the previous frame's cfo, timing from the preamble alone
+        cfo = cfo_hint; t0 = wrap(cfo - fu)
+        for sgn in (+1, -1):
+            start_chip = coarse - back + ksync - 6 * N
+            y2 = cut(start_chip, 6 + 4 + 2 + 1, shift_samples=sgn * t0 * dec)
+            k = np.arange(len(y2)); y2 = y2 * np.exp(-2j * np.pi * cfo * k / N).astype(np.complex64)
+            e = sum(abs(wrap(_fine_peak(y2[6 * N + j * N:6 * N + (j + 1) * N], dn, N)[0] - w))
+                    for j, w in ((-2, 0), (-1, 0), (0, s0), (1, s1)))
+            if best is None or e < best[0]:
+                best = (e, cfo, sgn * t0, start_chip, [])
+        _dbg["fallback"] = "cfo_hint"
+    if best is None:
+        raise RuntimeError(f"no plausible cfo/timing: {_dbg}")
+    e, cfo, tau, start_chip, vals = best
+    # --- 4. refine on the aligned stream: residual up bin ru = dcfo - dtau, down bin rd = dcfo + dtau
+    ks = 6 * N
+    def measure(cfo, tau):
+        y2 = cut(start_chip, 6 + 4 + 2 + 1, shift_samples=tau * dec)
+        k = np.arange(len(y2)); y2 = y2 * np.exp(-2j * np.pi * cfo * k / N).astype(np.complex64)
+        ru = float(np.mean([_fine_peak(y2[ks + j * N:ks + (j + 1) * N], dn, N)[0] for j in (-4, -3, -2, -1)]))
+        rd = float(np.mean([_fine_peak(y2[ks + j * N:ks + (j + 1) * N], up, N)[0] for j in (2, 3)]))
+        sy = [_fine_peak(y2[ks + j * N:ks + (j + 1) * N], dn, N)[0] % N for j in (0, 1)]
+        return ru, rd, sy, y2
+    for _ in range(3):
+        ru, rd, sy, _y = measure(cfo, tau)
+        dcfo, dtau = (ru + rd) / 2, (rd - ru) / 2
+        cand = [(cfo + dcfo, tau + dtau), (cfo + dcfo, tau - dtau)]
+        scored = []
+        for c, t in cand:
+            ru2, rd2, _, _ = measure(c, t)
+            scored.append((abs(ru2) + abs(rd2), c, t))
+        scored.sort()
+        if scored[0][0] >= abs(ru) + abs(rd):
+            break
+        _, cfo, tau = scored[0]
+    ru, rd, sy, _y = measure(cfo, tau)
+    e = abs(ru) + abs(rd)
+    info = dict(cfo=cfo, sto=tau, sync=sy, err=round(e, 3), pre=[ru, rd])
+    # payload starts 2 sync + 2.25 down-chirps after the first sync window
+    pay_chip = start_chip + 6 * N + 2 * N + 2.25 * N
+    return cfo, tau, pay_chip, info
+
+
+def demod_from(x, fs, offset_hz, bw, sf, cfo, tau, pay_chip, nsym):
+    from scipy.signal import resample_poly
+    N, up, dn = chirps(sf)
+    dec = int(round(fs / bw))
+    k0 = int(round(pay_chip * dec + tau * dec))  # same convention as synchronize.cut
+    seg = x[k0:k0 + nsym * N * dec]
+    n = np.arange(len(seg), dtype=np.float64) + k0
+    seg = seg * np.exp(-2j * np.pi * offset_hz * n / fs).astype(np.complex64)
+    y = resample_poly(seg, 1, dec).astype(np.complex64)
+    k = np.arange(len(y)); y = y * np.exp(-2j * np.pi * cfo * k / N).astype(np.complex64)
+    syms = []; conf = []
+    for i in range(nsym):
+        w = y[i * N:(i + 1) * N]
+        if len(w) < N: break
+        v, m = _fine_peak(w, dn, N, 4)
+        syms.append(int(round(v)) % N); conf.append(m)
+    return np.array(syms), np.array(conf)
 
 
 # ------------------------------------------------------------------ bit level
@@ -266,7 +418,7 @@ def lora_crc(payload):
 
 
 # ------------------------------------------------------------------ frame decode
-def decode_frame(syms, sf, dewhiten=True, ldro=False, verbose=True):
+def decode_frame(syms, sf, dewhiten=True, ldro=False, verbose=True, header_only=False):
     """syms: demodulated symbol values starting at the first header symbol."""
     N = 1 << sf
     # --- header block: 8 symbols at CR4/8, sf-2 bits per symbol ("reduced rate")
@@ -292,6 +444,8 @@ def decode_frame(syms, sf, dewhiten=True, ldro=False, verbose=True):
               f"chk={hdr_chk:#04x} calc={chk:#04x} {'OK' if hdr_ok else 'MISMATCH'}")
     if not hdr_ok or cr < 1 or cr > 4:
         return None
+    if header_only:
+        return dict(length=length, cr=cr, has_crc=has_crc)
     payload_nibbles = list(nibbles[5:])           # leftover nibbles of the header block (SF>7)
     need = 2 * length + (4 if has_crc else 0)
     # --- payload blocks
@@ -303,8 +457,7 @@ def decode_frame(syms, sf, dewhiten=True, ldro=False, verbose=True):
         if len(blk) < cw_len:
             if verbose: print(f"ran out of symbols: have {len(payload_nibbles)}/{need} nibbles")
             return None
-        vals = [gray_decode((s - 1) % N) for s in blk]
-        if ldro: vals = [v >> 2 for v in vals]
+        vals = [gray_decode(((s - 1) % N) >> 2) if ldro else gray_decode((s - 1) % N) for s in blk]
         for cw in deinterleave(vals, sf_pl, cw_len):
             nib, corr = hamming_decode(cw, cw_len); corrected += corr
             payload_nibbles.append(nib)
@@ -333,6 +486,76 @@ def whitening(n):
     return bytes(out)
 
 
+# ------------------------------------------------------------------ encoder (reference symbols)
+def _gray_inv(v):
+    g = 0
+    while v:
+        g ^= v; v >>= 1
+    return g
+
+
+def _hdr_checksum(n0, n1, n2):
+    c4 = (n0 >> 3 & 1) ^ (n0 >> 2 & 1) ^ (n0 >> 1 & 1) ^ (n0 & 1)
+    c3 = (n0 >> 3 & 1) ^ (n1 >> 3 & 1) ^ (n1 >> 2 & 1) ^ (n1 >> 1 & 1) ^ (n2 & 1)
+    c2 = (n0 >> 2 & 1) ^ (n1 >> 3 & 1) ^ (n1 & 1) ^ (n2 >> 3 & 1) ^ (n2 >> 1 & 1)
+    c1 = (n0 >> 1 & 1) ^ (n1 >> 2 & 1) ^ (n1 & 1) ^ (n2 >> 2 & 1) ^ (n2 >> 1 & 1) ^ (n2 & 1)
+    c0 = (n0 & 1) ^ (n1 >> 1 & 1) ^ (n2 >> 3 & 1) ^ (n2 >> 2 & 1) ^ (n2 >> 1 & 1) ^ (n2 & 1)
+    return (c4 << 4) | (c3 << 3) | (c2 << 2) | (c1 << 1) | c0
+
+
+def _hamming_encode(n, cw_len):
+    d0, d1, d2, d3 = (n >> 3) & 1, (n >> 2) & 1, (n >> 1) & 1, n & 1
+    if cw_len == 5:
+        q = [d0 ^ d1 ^ d2 ^ d3]
+    else:
+        q = [d1 ^ d2 ^ d3, d0 ^ d1 ^ d2, d0 ^ d2 ^ d3, d0 ^ d1 ^ d3][:cw_len - 4]
+    cw = n
+    for i, b in enumerate(q):
+        cw |= b << (4 + i)
+    return cw
+
+
+def _interleave(cws, sf_app, cw_len):
+    """inverse of deinterleave(): sf_app codewords -> cw_len symbol values of sf_app bits"""
+    out = []
+    for i in range(cw_len):
+        v = 0
+        for j in range(sf_app):
+            v |= ((cws[(i - j - 1) % sf_app] >> i) & 1) << (sf_app - 1 - j)
+        out.append(v)
+    return out
+
+
+def encode(payload, sf, cr=1, has_crc=True, ldro=False):
+    """payload bytes -> list of transmitted symbol values (explicit header), matching decode_frame."""
+    N = 1 << sf
+    wp = bytes(b ^ w for b, w in zip(payload, whitening(len(payload))))
+    data = bytearray(wp)
+    if has_crc:
+        c = lora_crc(payload)
+        data += bytes([c & 0xFF, c >> 8])
+    nib = []
+    for b in data:
+        nib += [b & 0xF, b >> 4]
+    L_ = len(payload)
+    n0, n1, n2 = L_ >> 4, L_ & 0xF, (cr << 1) | (1 if has_crc else 0)
+    chk = _hdr_checksum(n0, n1, n2)
+    hdr = [n0, n1, n2, chk >> 4, chk & 0xF]
+    sf_app = sf - 2
+    first = hdr + nib[:sf_app - 5]
+    rest = nib[sf_app - 5:]
+    first += [0] * (sf_app - len(first))
+    syms = [((_gray_inv(v) << 2) + 1) % N for v in _interleave([_hamming_encode(n, 8) for n in first], sf_app, 8)]
+    cw_len = 4 + cr
+    sf_pl = sf - 2 if ldro else sf
+    for k in range(0, len(rest), sf_pl):
+        blk = rest[k:k + sf_pl]
+        blk += [0] * (sf_pl - len(blk))
+        for v in _interleave([_hamming_encode(n, cw_len) for n in blk], sf_pl, cw_len):
+            syms.append(((_gray_inv(v) << (2 if ldro else 0)) + 1) % N)
+    return syms
+
+
 # ------------------------------------------------------------------ main
 def main():
     ap = argparse.ArgumentParser()
@@ -344,31 +567,45 @@ def main():
     ap.add_argument("--bw", type=float, default=125e3)
     ap.add_argument("--expect", default=None)
     ap.add_argument("--raw", action="store_true", help="do not de-whiten the payload")
+    ap.add_argument("--sync", type=lambda v: int(v, 0), default=0x34)
+    ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--ldro", type=int, default=None, help="force low-data-rate optimisation 0/1 (default: auto)")
     ap.add_argument("--max-frames", type=int, default=50)
     a = ap.parse_args()
 
     x = load_cs16(a.cap)
     y = to_baseband(x, a.fs, a.offset_khz * 1e3, a.bw)
     N = 1 << a.sf
+    ldro = a.ldro if a.ldro is not None else (N / a.bw > 0.016)
     print(f"{len(x)} samples @ {a.fs:.0f} -> {len(y)} @ {a.bw:.0f} ({len(y) / a.bw:.1f} s), N={N}")
-    pos = 0; found = 0; ok = 0
+    pos = 0; found = 0; ok = 0; last_cfo = None
     while found < a.max_frames:
         start, b = find_preamble(y[pos:], a.sf)
         if start is None: break
         start += pos
         try:
-            ps, cfo, sync, n_up, sto, astart = sync_estimate(y, start, a.sf)
+            cfo, sto, pay, info = synchronize(x, a.fs, a.offset_khz * 1e3, a.bw, a.sf, start + 2 * N, syncword=a.sync, cfo_hint=last_cfo)
         except Exception as e:
-            print("sync failed:", e); pos = start + N; continue
+            if a.verbose: print(f"  [no sync @ {start / a.bw:.3f} s: {e}]")
+            pos = start + 4 * N; continue
         found += 1
-        syms, conf, info = refine_and_demod(x, a.fs, a.offset_khz * 1e3, a.bw, a.sf, astart, n_up, 8 + 520)
-        cfo, sto, sync = info['cfo'], info['sto'], info['sync']
-        print(f"\nframe {found} @ {start / a.bw:.3f} s: {n_up} up-chirps, sync {sync}, "
-              f"cfo {cfo:+.2f} bins ({cfo * a.bw / N:+.0f} Hz), sto {sto:+.2f} chips, sync_q {info['sync_q']}, conf {conf[:8].mean():.1f}")
+        if info["err"] < 0.5: last_cfo = cfo
+        syms, conf = demod_from(x, a.fs, a.offset_khz * 1e3, a.bw, a.sf, cfo, sto, pay, 8)
+        need = 8 + 4 + 8 * ((2 * (255 + 2)) // (a.sf - (2 if ldro else 0)) + 1)
+        hdr = decode_frame(syms, a.sf, ldro=ldro, verbose=False, header_only=True)
+        if hdr:
+            nib = 2 * hdr["length"] + (4 if hdr["has_crc"] else 0)
+            need = 8 + (4 + hdr["cr"]) * (nib // (a.sf - (2 if ldro else 0)) + 2)
+        if not hdr:
+            need = 8
+        syms, conf = demod_from(x, a.fs, a.offset_khz * 1e3, a.bw, a.sf, cfo, sto, pay, need)
+        ps = int(pay) + len(syms) * N
+        print(f"\nframe {found} @ {start / a.bw:.3f} s: pre {[round(float(v), 2) for v in info['pre']]} sync {[round(float(v), 2) for v in info['sync']]} "
+              f"cfo {cfo:+.2f} bins ({cfo * a.bw / N:+.0f} Hz), sto {sto:+.2f} chips, err {info['err']}, conf {conf[:8].mean():.1f}")
         if a.mode == "scan":
             print("  symbols:", syms[:24].tolist())
         else:
-            r = decode_frame(syms, a.sf, dewhiten=not a.raw)
+            r = decode_frame(syms, a.sf, dewhiten=not a.raw, ldro=ldro)
             if r:
                 p = r["payload"]
                 txt = p.decode("ascii", "replace")
@@ -377,7 +614,7 @@ def main():
                 if a.expect and a.expect.encode() in p: ok += 1; print("  MATCHES expected text")
                 if a.mode == "whiten":
                     print("  payload xor whitening table (all-zero TX should give zeros):", p.hex())
-        pos = ps + (8 + 10) * N
+        pos = max(ps, start + 12 * N)
     print(f"\n{found} frames found" + (f", {ok} matched" if a.expect else ""))
 
 
